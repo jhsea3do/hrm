@@ -1,4 +1,7 @@
-import sys, ldap3, jwt
+import os, json
+import jwt
+from flask import request
+from .helper_ldap3 import *
 
 def encode_ldap_auth_token(cred, secret="secret", algorithm="HS256"):
     return jwt.encode(cred, secret, algorithm=algorithm)
@@ -6,61 +9,56 @@ def encode_ldap_auth_token(cred, secret="secret", algorithm="HS256"):
 def decode_ldap_auth_token(token, secret="secret", algorithm="HS256"):
     return jwt.decode(token, secret, algorithm=algorithm)
 
-def get_ldap_user_basedn(uid, config):
-    if "admin" == uid:
-        return config['ldap.admin.basedn']
-    basedn = config['ldap.user.basedn'] % uid
-    return basedn
+def get_config():
+    from .config import config
+    return config
 
-def get_ldap_conn(server, config, basedn=None, passwd=None):
-    basedn = basedn or config['ldap.admin.basedn']
-    passwd = passwd or config['ldap.admin.passwd']
-    conn = ldap3.Connection(server, user=basedn, password=passwd, \
-         auto_bind=False, lazy=False, raise_exceptions=True)
-    return conn
+def get_request_paged_params():
+    default = { "size": 10, "page": 0 }
+    for k in default.keys():
+        if request.args.__contains__(k):
+            default[k] = int(request.args[k])
+    return default
 
-def get_ldap_whoami(conn, config):
-    return conn.extend.standard.who_am_i()
+def request_is_json():
+    return request.headers['content-type'] == 'application/json'
 
-def get_ldap_search_scope(scope):
-    if "sub" == scope:
-        return ldap3.SUBTREE
-    elif "base" == scope:
-        return ldap3.BASE
+def get_request_token():
+    return request.headers['x-auth-token']
+
+def gen_auth_token(cred, config):
+    return bytes.decode(encode_ldap_auth_token(cred))
+
+def load_data(filename):
+    with open(filename, 'r') as f:
+        return f.read()
+
+def load_json(filename):
+    return json.loads(load_data(filename))
+
+def get_helper(cred_or_token, config):
+    cred = None
+    if not type(cred_or_token) == dict:
+        token = str(cred_or_token)
+        cred = decode_ldap_auth_token(token)
     else:
-        return ldap3.LEVEL
+        cred = cred_or_token
+    uid = cred.__contains__("username") and cred['username']
+    pwd = cred.__contains__("password") and cred['password']
+    user_basedn = get_ldap_user_basedn(uid, config)
+    return get_ldap_helper(config, basedn=user_basedn, passwd=pwd)
 
-def get_ldap_helper(config, basedn=None, passwd=None):
-    ldap_host = config['ldap.host']
-    ldap_port = config['ldap.port']
-    server = ldap3.Server(ldap_host, port=int(ldap_port), get_info=ldap3.ALL)
-    conn = get_ldap_conn(server, config, basedn=basedn, passwd=passwd)
-    def bind():
-        return conn.bind()
-    def unbind():
-        return conn.unbind()
-    def whoami():
-        return conn.extend.standard.who_am_i()
-    def search(basedn, filter, scope="sub", attrs=["*"], limit=10):
-        if conn.search(
-            search_base = basedn,
-            search_filter = filter,
-            search_scope = get_ldap_search_scope(scope),
-            attributes = attrs,
-            paged_size = limit,
-        ):
-            return conn.entries
-        else:
-            return None
-    def get_uid():
-        return basedn
-    def get_pwd():
-        return passwd
-    return {
-        "get_uid": get_uid,
-        "get_pwd": get_pwd,
-        "bind": bind,
-        "unbind": unbind,
-        "search": search,
-        "whoami": whoami,
-    }
+def do_request(callback, helper):
+    ret = None
+    if helper['bind']():
+        ret = callback(helper)
+        helper['unbind']()
+    return ret
+
+def do_search(helper, basedn, filter, **kwargs):
+    def handler(helper):
+        results = []
+        for entry in helper['search'](basedn, filter, **kwargs):
+            results.append(json.loads(entry.entry_to_json()))
+        return results
+    return do_request(handler, helper)
